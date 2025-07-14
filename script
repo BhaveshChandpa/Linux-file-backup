@@ -1,0 +1,92 @@
+#!/bin/bash
+
+# === CONFIGURATION ===
+BASE_LOG_DIR="/home/administrator/backup_log"
+DATE=$(date '+%Y-%m-%d')
+TIME=$(date '+%Y-%m-%d %H:%M:%S')
+START_TIMESTAMP=$(date +%s)
+
+LOG_DIR="$BASE_LOG_DIR/$DATE"
+mkdir -p "$LOG_DIR"
+
+# Logs go inside date folder
+Backup_LOG="$LOG_DIR/backup.log"
+RSYNC_LOG="$LOG_DIR/rsync_$DATE.log"
+CHANGED_FILE_LIST="$LOG_DIR/changed_files.txt"
+NEW_FILES_LOG="$LOG_DIR/new_files.txt"
+MODIFIED_FILES_LOG="$LOG_DIR/modified_files.txt"
+DELETED_LOG="$LOG_DIR/deleted_files.txt"
+MOUNT_LOG="$LOG_DIR/mount.log"
+UMOUNT_LOG="$LOG_DIR/umount.log"
+
+SOURCE_DIR="/home/bhavesh"
+DEST_DIR="/home/administrator/backup/bhavesh-backup"
+
+TODAY_FILE_LIST="$LOG_DIR/filelist_today.txt"
+YESTERDAY_FILE_LIST="$BASE_LOG_DIR/filelist_yesterday.txt"  # stays outside for next run
+
+# Optional: symlink to latest
+ln -sfn "$LOG_DIR" "$BASE_LOG_DIR/latest"
+
+# === Start log ===
+echo "--------------------------------------------------------------------------------------------" >> "$Backup_LOG"
+echo "$TIME - Backup started." >> "$Backup_LOG"
+
+# === Ensure mount point exists ===
+if [ ! -d "$DEST_DIR" ]; then
+  sudo mkdir -p "$DEST_DIR"
+fi
+
+# === Mount the CIFS share ===
+sudo mount -t cifs //192.168.101.222/backup/bhavesh-backup "$DEST_DIR" \
+  -o username=website,password=862001,vers=3.0,uid=$(id -u),gid=$(id -g),noperm,noatime
+
+if [ $? -ne 0 ]; then
+  echo "$TIME - ERROR: Failed to mount CIFS share." >> "$MOUNT_LOG"
+  echo "$TIME - Backup aborted due to mount failure." >> "$Backup_LOG"
+  exit 1
+fi
+
+# === Generate today's file list (relative paths only) ===
+find "$SOURCE_DIR" -type f | sed "s|^$SOURCE_DIR/||" | sort > "$TODAY_FILE_LIST"
+
+# === Compare with yesterday's list to find deleted files ===
+if [ -f "$YESTERDAY_FILE_LIST" ]; then
+  comm -23 "$YESTERDAY_FILE_LIST" "$TODAY_FILE_LIST" | while read deleted_file; do
+    echo "[DELETED ON SOURCE] $deleted_file" >> "$CHANGED_FILE_LIST"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - [DELETED ON SOURCE] $deleted_file" >> "$DELETED_LOG"
+  done
+fi
+
+# === Run rsync WITHOUT --delete, WITH stats ===
+sudo rsync -a --itemize-changes --ignore-errors --inplace --stats --exclude='.*' --exclude='snap/' --no-links \
+  "$SOURCE_DIR/" "$DEST_DIR/" >> "$RSYNC_LOG" 2>&1
+
+# === Extract new files ===
+grep '^>f+++++++++' "$RSYNC_LOG" | awk '{print $2}' > "$NEW_FILES_LOG"
+
+# === Extract modified files ===
+grep '^\.[fd]' "$RSYNC_LOG" | awk '{print $2}' > "$MODIFIED_FILES_LOG"
+
+# === All changed or new files ===
+grep '^>f' "$RSYNC_LOG" | awk '{print $2}' > "$CHANGED_FILE_LIST"
+
+# === Save today's file list as yesterday's for next run ===
+cp "$TODAY_FILE_LIST" "$YESTERDAY_FILE_LIST"
+
+# === Unmount CIFS share ===
+sudo umount "$DEST_DIR"
+END_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+END_TIMESTAMP=$(date +%s)
+DURATION=$((END_TIMESTAMP - START_TIMESTAMP))
+
+if [ $? -ne 0 ]; then
+  echo "$END_TIME - WARNING: Failed to unmount CIFS share." >> "$UMOUNT_LOG"
+  echo "$END_TIME - Backup finished with unmount warning." >> "$Backup_LOG"
+else
+  echo "$END_TIME - Backup completed successfully." >> "$Backup_LOG"
+  echo "$END_TIME - Duration: $DURATION seconds" >> "$Backup_LOG"
+  echo "$END_TIME - New files: $NEW_FILES_LOG" >> "$Backup_LOG"
+  echo "$END_TIME - Modified files: $MODIFIED_FILES_LOG" >> "$Backup_LOG"
+  echo "$END_TIME - All changes: $CHANGED_FILE_LIST" >> "$Backup_LOG"
+fi
